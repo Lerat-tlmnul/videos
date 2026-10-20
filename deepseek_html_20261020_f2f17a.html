@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1859 — Éruption solaire</title>
+<style>
+  :root { --bg:#060608; --fg:#f4f1ea; --accent:#e8b45a; --ui:#1b1d23; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--ui); color:var(--fg); font-family:system-ui,sans-serif; padding:16px; }
+  .player { width:min(96vw,420px); }
+  canvas { width:100%; height:auto; aspect-ratio:9/16; display:block; border-radius:12px; background:var(--bg); }
+  .controls { display:flex; align-items:center; gap:10px; margin-top:12px; flex-wrap:wrap; }
+  button { background:var(--accent); color:#111; border:0; border-radius:999px; padding:9px 16px; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:default; }
+  button:focus-visible { outline:3px solid var(--fg); outline-offset:3px; }
+  input[type=range] { flex:1; min-width:120px; accent-color:var(--accent); }
+  .time { font-variant-numeric:tabular-nums; font-size:13px; opacity:.75; }
+  #msg { margin-top:12px; font-size:14px; min-height:1.4em; line-height:1.4; }
+  #msg.error { color:#ff8a7a; }
+  .dl { display:inline-block; margin-top:10px; background:var(--fg); color:#111; padding:10px 18px; border-radius:999px; text-decoration:none; font-weight:600; }
+  [hidden] { display:none !important; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
+</head>
+<body>
+<main class="player">
+  <canvas id="stage" width="1080" height="1920" aria-label="Motion design — éruption solaire 1859"></canvas>
+  <div class="controls">
+    <button id="play" disabled>Lecture</button>
+    <input id="seek" type="range" min="0" max="4" step="0.01" value="0" aria-label="Position">
+    <span class="time" id="time">0:00 / 0:04</span>
+    <button id="export" disabled>Exporter la vidéo MP4</button>
+  </div>
+  <div id="msg" role="status"></div>
+  <a id="dl" class="dl" hidden>Télécharger la vidéo</a>
+</main>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------- Détection mémoire (v1.5.2) ----------
+  const RAM_GB = Number.isFinite(navigator.deviceMemory) ? navigator.deviceMemory : 8;
+  const LOW_MEM = RAM_GB <= 8;
+  const VERY_LOW = RAM_GB <= 4;
+
+  // ---------- Configuration ----------
+  const DURATION = 4, FPS = 30;
+  const W = VERY_LOW ? 720  : 1080;
+  const H = VERY_LOW ? 1280 : 1920;
+  const SEG_SECONDS = LOW_MEM ? 2 : 3;
+
+  const QUALITY = {
+    draft:    { jpeg: 0.85, crf: 26, preset: 'ultrafast' },
+    standard: { jpeg: 0.92, crf: 20, preset: 'veryfast' },
+    high:     { jpeg: 0.95, crf: 16, preset: 'medium' },
+  };
+  const Q = QUALITY[LOW_MEM ? 'draft' : 'standard'];
+
+  // ---------- Éléments ----------
+  const canvas = document.getElementById('stage');
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const $ = id => document.getElementById(id);
+  const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+  const lerp = (a, b, u) => a + (b - a) * u;
+
+  // ---------- État ----------
+  let busy = false, playing = false, cur = 0, lastNow = 0, raf = 0, lastLog = '';
+  let grainCanvas = null;
+
+  function say(text, isError = false) {
+    const m = $('msg');
+    m.textContent = text;
+    m.classList.toggle('error', isError);
+  }
+
+  function isMemoryError(message) {
+    if (!message) return false;
+    const s = String(message).toLowerCase();
+    return s.includes('out of memory') || s.includes('oom') ||
+           s.includes('aborted') || s.includes('cannot enlarge memory') ||
+           s.includes('memory access out of bounds');
+  }
+
+  // ---------- Hasard déterministe ----------
+  function rng(seed) {
+    let s = seed % 2147483647; if (s <= 0) s += 2147483646;
+    return () => { s = (s * 16807) % 2147483647; return (s - 1) / 2147483646; };
+  }
+
+  // ---------- Easings ----------
+  const easeOutCubic = u => 1 - Math.pow(1 - u, 3);
+  const easeInCubic  = u => u * u * u;
+  const easeInOutCubic = u => u < 0.5 ? 4*u*u*u : 1 - Math.pow(-2*u + 2, 3) / 2;
+  const easeOutBack = (u, s = 1.4) => 1 + (s + 1) * Math.pow(u - 1, 3) + s * Math.pow(u - 1, 2);
+  const easeOutExpo = u => u === 1 ? 1 : 1 - Math.pow(2, -10 * u);
+
+  // ---------- Grain (précalculé une fois) ----------
+  function getGrain() {
+    if (grainCanvas) return grainCanvas;
+    const gw = 256, gh = 256;
+    grainCanvas = document.createElement('canvas');
+    grainCanvas.width = gw; grainCanvas.height = gh;
+    const gctx = grainCanvas.getContext('2d');
+    const img = gctx.createImageData(gw, gh);
+    const r = rng(1859);
+    for (let i = 0; i < img.data.length; i += 4) {
+      const v = Math.floor(r() * 255);
+      img.data[i] = v; img.data[i+1] = v; img.data[i+2] = v;
+      img.data[i+3] = 255;
+    }
+    gctx.putImageData(img, 0, 0);
+    return grainCanvas;
+  }
+
+  // ---------- Scène : éruption solaire 1859 ----------
+  // Phases :
+  //  0.00 – 0.70 : sphère se déploie (scale 0 -> 1), easeOutBack
+  //  0.50 – 2.20 : filaments de plasma s'étirent et explosent
+  //  0.00 – 2.40 : caméra recule (zoom 1.6 -> 1.0), easeInOutCubic
+  //  0.80 – 2.40 : lignes magnétiques arcs puis rupture
+  //  2.00 – 3.20 : particules projetées hors cadre
+  //  2.60 – 3.40 : typographie « 1859 »
+  //  3.55 – 4.00 : flash blanc
+  const C = {
+    bg: '#050406',
+    sunCore: '#ff7a18',
+    sunMid:  '#ffb347',
+    sunHot:  '#ffe9b0',
+    plasma:  '#fff3d0',
+    gold:    '#ffcf6b',
+    field:   'rgba(255, 210, 140, 0.55)',
+    text:    '#f4f1ea',
+  };
+
+  function drawSun(cx, cy, radius, t) {
+    // halo
+    const halo = ctx.createRadialGradient(cx, cy, radius * 0.4, cx, cy, radius * 2.4);
+    halo.addColorStop(0, 'rgba(255, 140, 40, 0.45)');
+    halo.addColorStop(0.5, 'rgba(255, 90, 20, 0.15)');
+    halo.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = halo;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius * 2.4, 0, Math.PI * 2);
+    ctx.fill();
+
+    // corps
+    const body = ctx.createRadialGradient(
+      cx - radius * 0.3, cy - radius * 0.35, radius * 0.1,
+      cx, cy, radius
+    );
+    body.addColorStop(0, C.sunHot);
+    body.addColorStop(0.35, C.sunMid);
+    body.addColorStop(0.8, C.sunCore);
+    body.addColorStop(1, '#8a2a05');
+    ctx.fillStyle = body;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.fill();
+
+    // filaments de surface (déterministes, animés lentement)
+    const r = rng(42);
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius * 0.985, 0, Math.PI * 2);
+    ctx.clip();
+    for (let i = 0; i < 26; i++) {
+      const a0 = r() * Math.PI * 2;
+      const len = radius * (0.25 + r() * 0.55);
+      const wob = Math.sin(t * 2.4 + i) * 0.35;
+      const x0 = cx + Math.cos(a0) * radius * 0.2;
+      const y0 = cy + Math.sin(a0) * radius * 0.2;
+      const x1 = cx + Math.cos(a0 + wob) * len;
+      const y1 = cy + Math.sin(a0 + wob) * len;
+      ctx.strokeStyle = i % 3 === 0 ? 'rgba(255,245,210,0.55)' : 'rgba(255,190,90,0.35)';
+      ctx.lineWidth = 1.2 + r() * 2.2;
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.quadraticCurveTo(
+        cx + Math.cos(a0 + wob * 2) * len * 0.7,
+        cy + Math.sin(a0 + wob * 2) * len * 0.7,
+        x1, y1
+      );
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawFieldLines(cx, cy, radius, t, rupture) {
+    // arcs magnétiques autour du soleil, se rompent après rupture
+    const r = rng(7);
+    for (let i = 0; i < 9; i++) {
+      const base = (i / 9) * Math.PI * 2 + r() * 0.25;
+      const span = 0.55 + r() * 0.5;
+      const height = radius * (1.15 + r() * 0.9);
+      const brk = clamp((rupture - i * 0.04) / 0.35, 0, 1);
+      const alpha = (0.55 - brk * 0.5) * (1 - brk * 0.2);
+      if (alpha <= 0.01) continue;
+      ctx.strokeStyle = `rgba(255, 214, 150, ${alpha})`;
+      ctx.lineWidth = 1.4;
+      const steps = 28;
+      ctx.beginPath();
+      for (let s = 0; s <= steps; s++) {
+        const u = s / steps;
+        const a = base + span * (u - 0.5);
+        // décalage de rupture
+        const off = brk * (r() * 0.06);
+        const rr = radius + Math.sin(u * Math.PI) * (height - radius) + off * radius;
+        const x = cx + Math.cos(a) * rr;
+        const y = cy + Math.sin(a) * rr;
+        if (s === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+  }
+
+  function drawPlasmaBurst(cx, cy, radius, t) {
+    // filaments de plasma blanc/or qui s'étirent puis explosent
+    const r = rng(123);
+    const p = clamp((t - 0.5) / 1.7, 0, 1); // 0.5 -> 2.2
+    const burst = clamp((t - 1.4) / 0.8, 0, 1); // explosion à partir de 1.4
+    const reach = lerp(0.2, 1.0, easeOutCubic(p));
+    for (let i = 0; i < 40; i++) {
+      const a = r() * Math.PI * 2;
+      const baseR = radius * (0.95 + r() * 0.12);
+      const maxLen = radius * (0.5 + r() * 1.6);
+      const len = maxLen * reach + burst * radius * (0.4 + r() * 1.2);
+      const wob = Math.sin(t * 6 + i * 1.7) * 0.06 * (1 - burst);
+      const x0 = cx + Math.cos(a) * baseR;
+      const y0 = cy + Math.sin(a) * baseR;
+      const x1 = cx + Math.cos(a + wob) * (baseR + len);
+      const y1 = cy + Math.sin(a + wob) * (baseR + len);
+      const alpha = (1 - burst * 0.7) * (0.35 + 0.5 * (1 - p) + 0.2 * burst);
+      ctx.strokeStyle = i % 4 === 0
+        ? `rgba(255, 245, 210, ${alpha})`
+        : `rgba(255, 200, 110, ${alpha * 0.8})`;
+      ctx.lineWidth = (1.2 + r() * 2.4) * (1 + burst * 1.5);
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.quadraticCurveTo(
+        cx + Math.cos(a + wob * 3) * (baseR + len * 0.55),
+        cy + Math.sin(a + wob * 3) * (baseR + len * 0.55),
+        x1, y1
+      );
+      ctx.stroke();
+    }
+  }
+
+  function drawParticles(cx, cy, radius, t) {
+    // particules lumineuses projetées vers l'extérieur
+    const r = rng(999);
+    const start = 1.5;
+    const p = clamp((t - start) / (DURATION - start), 0, 1);
+    if (p <= 0) return;
+    const n = 120;
+    for (let i = 0; i < n; i++) {
+      const a = r() * Math.PI * 2;
+      const speed = 0.4 + r() * 1.6;
+      const dist = radius * (0.9 + easeOutCubic(p) * speed * 3.2);
+      const x = cx + Math.cos(a) * dist;
+      const y = cy + Math.sin(a) * dist;
+      const size = (1.5 + r() * 3.5) * (1 - p * 0.4);
+      const alpha = (1 - p) * (0.5 + r() * 0.5);
+      if (alpha <= 0.01) continue;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, size * 2.5);
+      g.addColorStop(0, `rgba(255, 245, 210, ${alpha})`);
+      g.addColorStop(0.4, `rgba(255, 190, 90, ${alpha * 0.7})`);
+      g.addColorStop(1, 'rgba(255,140,40,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(x, y, size * 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawVignette() {
+    const g = ctx.createRadialGradient(W/2, H/2, Math.min(W, H) * 0.25, W/2, H/2, Math.max(W, H) * 0.75);
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(1, 'rgba(0,0,0,0.65)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function drawGrain(t) {
+    const gc = getGrain();
+    const pattern = ctx.createPattern(gc, 'repeat');
+    // décalage déterministe léger
+    const ox = (Math.floor(t * FPS) * 37) % 256;
+    const oy = (Math.floor(t * FPS) * 91) % 256;
+    ctx.save();
+    ctx.globalAlpha = 0.08;
+    ctx.translate(-ox, -oy);
+    ctx.fillStyle = pattern;
+    ctx.fillRect(0, 0, W + 256, H + 256);
+    ctx.restore();
+  }
+
+  function drawText(t) {
+    // « 1859 » apparaît brièvement en bas, phase 2.6 -> 3.4
+    const p = clamp((t - 2.6) / 0.25, 0, 1);
+    const out = clamp((t - 3.2) / 0.2, 0, 1);
+    const alpha = easeOutCubic(p) * (1 - easeInCubic(out));
+    if (alpha <= 0.01) return;
+    const baseY = H * 0.82;
+    const rise = (1 - easeOutCubic(p)) * 30 + out * 20;
+    const size = Math.round(H * 0.085);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = C.text;
+    ctx.font = `700 ${size}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    // ombre douce
+    ctx.shadowColor = 'rgba(0,0,0,0.55)';
+    ctx.shadowBlur = size * 0.25;
+    ctx.fillText('1859', W / 2, baseY + rise);
+    ctx.restore();
+  }
+
+  function drawFlash(t) {
+    // flash blanc 3.55 -> 4.0
+    const p = clamp((t - 3.55) / 0.45, 0, 1);
+    if (p <= 0) return;
+    // montée rapide puis maintien léger
+    const a = p < 0.5 ? easeOutCubic(p * 2) : 1 - easeInCubic((p - 0.5) * 2) * 0.55;
+    ctx.save();
+    ctx.globalAlpha = clamp(a, 0, 1) * 0.95;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+  }
+
+  function renderAt(t) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = C.bg;
+    ctx.fillRect(0, 0, W, H);
+
+    // caméra recule : zoom 1.6 -> 1.0 sur 0 -> 2.4 s
+    const camP = clamp(t / 2.4, 0, 1);
+    const zoom = lerp(1.6, 1.0, easeInOutCubic(camP));
+
+    const cx = W / 2;
+    const cy = H * 0.46;
+    const baseRadius = Math.min(W, H) * 0.19;
+
+    // déploiement de la sphère 0 -> 0.7 s
+    const growP = clamp(t / 0.7, 0, 1);
+    const grow = easeOutBack(growP, 1.4);
+    const radius = baseRadius * grow;
+
+    // rupture des lignes magnétiques : 1.2 -> 2.4
+    const rupture = clamp((t - 1.2) / 1.2, 0, 1);
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(zoom, zoom);
+    ctx.translate(-cx, -cy);
+
+    if (radius > 0.5) {
+      drawSun(cx, cy, radius, t);
+      drawFieldLines(cx, cy, radius, t, rupture);
+      drawPlasmaBurst(cx, cy, radius, t);
+      drawParticles(cx, cy, radius, t);
+    }
+
+    ctx.restore();
+
+    drawVignette();
+    drawGrain(t);
+    drawText(t);
+    drawFlash(t);
+  }
+
+  // ---------- Lecteur ----------
+  const fmt = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+  function setTime(t) {
+    cur = clamp(t, 0, DURATION);
+    renderAt(cur);
+    $('seek').value = cur;
+    $('time').textContent = `${fmt(cur)} / ${fmt(DURATION)}`;
+  }
+  function tick(now) {
+    if (!playing) return;
+    cur += (now - lastNow) / 1000; lastNow = now;
+    if (cur >= DURATION) { setTime(DURATION); pause(); return; }
+    setTime(cur);
+    raf = requestAnimationFrame(tick);
+  }
+  function play() {
+    if (busy) return;
+    if (cur >= DURATION) cur = 0;
+    playing = true; $('play').textContent = 'Pause';
+    lastNow = performance.now();
+    raf = requestAnimationFrame(tick);
+  }
+  function pause() {
+    playing = false; cancelAnimationFrame(raf);
+    $('play').textContent = 'Lecture';
+  }
+
+  $('play').addEventListener('click', () => (playing ? pause() : play()));
+  $('seek').addEventListener('input', e => { if (busy) return; pause(); setTime(+e.target.value); });
+  document.addEventListener('keydown', e => {
+    if (busy || e.target.tagName === 'BUTTON') return;
+    if (e.code === 'Space') { e.preventDefault(); playing ? pause() : play(); }
+    if (e.code === 'ArrowRight') { pause(); setTime(cur + 0.5); }
+    if (e.code === 'ArrowLeft') { pause(); setTime(cur - 0.5); }
+  });
+
+  // ---------- Verrouillage ----------
+  function lockUI(locked) {
+    busy = locked;
+    $('export').disabled = locked;
+    $('play').disabled = locked;
+    $('seek').disabled = locked;
+  }
+
+  // ---------- Environnement ----------
+  function checkEnvironment() {
+    if (location.protocol === 'file:')
+      return 'Cette page est ouverte depuis un fichier local. Publiez-la ou ouvrez-la en https:// pour exporter la vidéo. Le lecteur fonctionne quand même.';
+    if (typeof FFmpegWASM === 'undefined' || typeof FFmpegUtil === 'undefined')
+      return 'Le moteur d’encodage n’a pas pu se charger. Vérifiez la connexion et rechargez la page.';
+    if (!canvas.captureStream && !canvas.toBlob)
+      return 'Ce navigateur ne peut pas lire le canevas.';
+    return null;
+  }
+
+  // ---------- Moteur ffmpeg ----------
+  let ffmpeg = null;
+  async function getFFmpeg() {
+    if (ffmpeg) return ffmpeg;
+    const ffBase = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd';
+    const coreBase = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
+    const instance = new FFmpegWASM.FFmpeg();
+    instance.on('log', ({ message }) => { lastLog = message; });
+    await instance.load({
+      classWorkerURL: await FFmpegUtil.toBlobURL(`${ffBase}/814.ffmpeg.js`, 'text/javascript'),
+      coreURL: await FFmpegUtil.toBlobURL(`${coreBase}/ffmpeg-core.js`, 'text/javascript'),
+      wasmURL: await FFmpegUtil.toBlobURL(`${coreBase}/ffmpeg-core.wasm`, 'application/wasm'),
+    });
+    ffmpeg = instance;
+    return ffmpeg;
+  }
+
+  // ---------- Export ----------
+  async function runExport() {
+    if (busy) return;
+    pause();
+    const resume = cur;
+    let step = 'Vérification de l’environnement';
+    lockUI(true);
+    $('dl').hidden = true;
+    try {
+      const envError = checkEnvironment();
+      if (envError) throw new Error(envError);
+
+      const total = Math.round(DURATION * FPS);
+      if (total > 1800) {
+        throw new Error(`Trop de frames (${total}). Réduis DURATION ou FPS : au-delà de 1800 frames, l’export n’aboutira pas en mémoire navigateur.`);
+      }
+      if (total > 600) {
+        say(`Attention : ${total} frames, l’export peut être long.`, false);
+      }
+
+      step = 'Chargement du moteur (première fois : environ 30 Mo)';
+      say(step + '…');
+      const f = await getFFmpeg();
+
+      const segFrames = Math.round(SEG_SECONDS * FPS);
+      const segFiles = [];
+      step = 'Rendu';
+      for (let start = 0; start < total; start += segFrames) {
+        const end = Math.min(total, start + segFrames);
+        const names = [];
+        for (let i = start; i < end; i++) {
+          renderAt(i / FPS);
+          const jpg = await new Promise(res => canvas.toBlob(res, 'image/jpeg', Q.jpeg));
+          if (!jpg) throw new Error('le canevas n’a pas pu être lu (une image externe bloque peut-être l’export)');
+          const name = `f${String(i).padStart(5, '0')}.jpg`;
+          await f.writeFile(name, new Uint8Array(await jpg.arrayBuffer()));
+          names.push(name);
+          say(`Rendu ${i + 1}/${total}`);
+        }
+
+        step = `Encodage du segment ${segFiles.length + 1}`;
+        say(step + '…');
+        const seg = `seg${start}.mp4`;
+        const code = await f.exec([
+          '-framerate', String(FPS), '-start_number', String(start),
+          '-i', 'f%05d.jpg', '-frames:v', String(end - start),
+          '-c:v', 'libx264', '-preset', Q.preset, '-crf', String(Q.crf),
+          '-pix_fmt', 'yuv420p', '-r', String(FPS), seg,
+        ]);
+        if (code !== 0) {
+          const mem = isMemoryError(lastLog);
+          throw new Error(mem
+            ? 'Le navigateur a interrompu l’encodage faute de mémoire. Réduis la résolution (720×1280) ou raccourcis les segments, puis réessaie.'
+            : `encodage H.264 refusé (code ${code}). Dernier log : ${lastLog}`);
+        }
+        segFiles.push(seg);
+        for (const n of names) await f.deleteFile(n);
+      }
+
+      step = 'Assemblage';
+      say('Assemblage de la vidéo…');
+      await f.writeFile('list.txt', segFiles.map(s => `file '${s}'`).join('\n'));
+      const code = await f.exec(['-f', 'concat', '-safe', '0', '-i', 'list.txt',
+                                 '-c', 'copy', '-movflags', '+faststart', 'out.mp4']);
+      if (code !== 0) {
+        const mem = isMemoryError(lastLog);
+        throw new Error(mem
+          ? 'Le navigateur a interrompu l’assemblage faute de mémoire. Réduis la résolution ou raccourcis les segments, puis réessaie.'
+          : `assemblage refusé (code ${code}). Dernier log : ${lastLog}`);
+      }
+
+      step = 'Vérification du fichier';
+      const data = await f.readFile('out.mp4');
+      if (!data || data.length < 1024) throw new Error('le fichier produit est vide');
+
+      // 1) Blob + lien AVANT toute suppression
+      const url = URL.createObjectURL(new Blob([data], { type: 'video/mp4' }));
+      const dl = $('dl');
+      dl.href = url;
+      dl.download = '1859-eruption-solaire.mp4';
+      dl.hidden = false;
+      say('Vidéo prête. Cliquez sur « Télécharger la vidéo ».');
+
+      // 2) Nettoyage protégé
+      try {
+        for (const s of segFiles) await f.deleteFile(s);
+        await f.deleteFile('list.txt');
+        await f.deleteFile('out.mp4');
+      } catch (cleanupErr) {
+        console.warn('Nettoyage partiel des fichiers virtuels :', cleanupErr);
+      }
+
+      // 3) Téléchargement auto, sans bloquer si refusé
+      try { dl.click(); } catch (_) {}
+    } catch (err) {
+      say(`Échec à l’étape « ${step} » : ${err.message || err}`, true);
+    } finally {
+      lockUI(false);
+      setTime(resume);
+    }
+  }
+
+  $('export').addEventListener('click', runExport);
+
+  // ---------- Démarrage ----------
+  (async () => {
+    $('seek').max = DURATION;
+    setTime(0);
+    const env = checkEnvironment();
+    if (env) { say(env, true); }
+    else {
+      const hint = LOW_MEM
+        ? `Profil mémoire prudent (${RAM_GB <= 4 ? 'très basse' : 'basse'} RAM détectée) : ${W}×${H}, qualité ${LOW_MEM ? 'draft' : 'standard'}, segments de ${SEG_SECONDS} s.`
+        : '';
+      say(hint);
+    }
+    try { await document.fonts.ready; } catch (_) {}
+    $('play').disabled = false;
+    $('export').disabled = !!env;
+  })();
+})();
+</script>
+</body>
+</html>
