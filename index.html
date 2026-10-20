@@ -435,7 +435,7 @@
   async function getFFmpeg() {
     if (ffmpeg) return ffmpeg;
     const ffBase = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd';
-    const coreBase = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
+    const coreBase = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm';
     const instance = new FFmpegWASM.FFmpeg();
     instance.on('log', ({ message }) => { lastLog = message; });
     await instance.load({
